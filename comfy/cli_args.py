@@ -239,6 +239,18 @@ database_default_path = os.path.abspath(
 parser.add_argument("--database-url", type=str, default=f"sqlite:///{database_default_path}", help="Specify the database URL, e.g. for an in-memory database you can use 'sqlite:///:memory:'.")
 parser.add_argument("--enable-assets", action="store_true", help="Enable the assets system (API routes, database synchronization, and background scanning).")
 
+# Ray distributed parallel execution
+parser.add_argument("--ray", action="store_true", help="Enable Ray distributed parallel execution (USP/xFuser).")
+parser.add_argument("--ray-gpus", type=int, default=None, help="Number of GPUs for Ray distributed execution. Defaults to detected CUDA GPUs.")
+parser.add_argument("--ray-ulysses-degree", type=int, default=1, help="Ulysses sequence parallel degree.")
+parser.add_argument("--ray-ring-degree", type=int, default=1, help="Ring attention degree.")
+parser.add_argument("--ray-cfg-degree", type=int, default=1, help="CFG parallel degree.")
+parser.add_argument("--ray-cluster-address", type=str, default="local", help="Ray cluster address.")
+parser.add_argument("--ray-cluster-namespace", type=str, default="default", help="Ray namespace.")
+parser.add_argument("--ray-attention", type=str, default="TORCH_FLASH", help="xFuser attention backend (TORCH_FLASH, FLASH_INFER, SAGE_FP8_CUDA, SAGE_FP8_SM90).")
+parser.add_argument("--ray-sync-ulysses", action="store_true", help="Use synchronized Ulysses path.")
+parser.add_argument("--skip-ray-nccl-test", action="store_true", dest="ray_skip_comm_test", default=False, help="Skip the Ray NCCL communication test at startup.")
+
 if comfy.options.args_parsing:
     args = parser.parse_args()
 else:

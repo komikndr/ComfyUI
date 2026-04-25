@@ -1,5 +1,9 @@
 <div align="center">
 
+## WARN
+
+**THIS IS EXPERIMENTAL SEQUENCE PARALLEL BRANCH USING RAY"
+
 # ComfyUI
 **The most powerful and modular visual AI engine and application.**
 

@@ -207,6 +207,20 @@ import hook_breaker_ac10a0
 import comfy.memory_management
 import comfy.model_patcher
 
+# Initialize Ray distributed runtime if --ray is enabled
+if args.ray:
+    try:
+        from comfy.distributed.ray_runtime import init_ray_runtime
+        ray_runtime = init_ray_runtime(args=args)
+        if ray_runtime is not None:
+            logging.info("Ray distributed runtime initialized successfully")
+        else:
+            logging.warning("Ray runtime returned None despite --ray flag")
+    except Exception as e:
+        logging.error(f"Failed to initialize Ray distributed runtime: {e}")
+        logging.error("Falling back to normal mode. Fix the error above and restart.")
+        args.ray = False
+
 if args.enable_dynamic_vram or (enables_dynamic_vram() and comfy.model_management.is_nvidia() and not comfy.model_management.is_wsl()):
     if (not args.enable_dynamic_vram) and (comfy.model_management.torch_version_numeric < (2, 8)):
         logging.warning("Unsupported Pytorch detected. DynamicVRAM support requires Pytorch version 2.8 or later. Falling back to legacy ModelPatcher. VRAM estimates may be unreliable especially on Windows")

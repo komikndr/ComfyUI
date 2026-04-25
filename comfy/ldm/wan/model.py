@@ -1,6 +1,7 @@
 # original version: https://github.com/Wan-Video/Wan2.1/blob/main/wan/modules/model.py
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 import math
+import types
 
 import torch
 import torch.nn as nn
@@ -12,6 +13,200 @@ from comfy.ldm.flux.math import apply_rope1
 import comfy.ldm.common_dit
 import comfy.model_management
 import comfy.patcher_extension
+from comfy.distributed.parallel_state import (
+    is_ray_enabled,
+    get_sp_world_size,
+    get_sp_rank,
+    get_sp_group,
+    get_parallel_config,
+)
+from comfy.distributed.ray_runtime import (
+    _setup_sage_fp8_cuda_kernel,
+    _setup_sage_fp8_sm90_kernel,
+)
+
+_xfuser_attention_fn = None
+_xfuser_attention_initialized = False
+
+
+def _init_xfuser_attention():
+    """Initialize xFuser attention function from parallel config.
+
+    Sets up the xFuserLongContextAttention with the configured backend
+    and SAGE kernel setup.
+    """
+    global _xfuser_attention_fn, _xfuser_attention_initialized
+    if _xfuser_attention_initialized:
+        return
+
+    config = get_parallel_config()
+    if config is None:
+        return
+
+    from xfuser.core.long_ctx_attention import xFuserLongContextAttention
+    from yunchang.kernels import AttnType
+
+    attn_type = AttnType[config.attention_backend]
+
+    # SAGE attention kernel setup
+    if config.attention_backend == "SAGE_FP8_CUDA":
+        _setup_sage_fp8_cuda_kernel()
+    elif config.attention_backend == "SAGE_FP8_SM90":
+        _setup_sage_fp8_sm90_kernel()
+
+    xfuser_attn = xFuserLongContextAttention(use_sync=config.sync_ulysses, attn_type=attn_type)
+
+    def _attention_fn(q, k, v, heads, **kwargs):
+        b, _, dim_head = q.shape
+        dim_head //= heads
+        q, k, v = map(lambda t: t.view(b, -1, heads, dim_head).transpose(1, 2), (q, k, v))
+
+        out = xfuser_attn(None, q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)).transpose(1, 2)
+        out = out.transpose(1, 2).reshape(b, -1, heads * dim_head)
+        return out
+
+    _xfuser_attention_fn = _attention_fn
+    _xfuser_attention_initialized = True
+
+
+def _get_xfuser_attention():
+    """Get xFuser attention function, initializing if needed.
+
+    Raises RuntimeError if xFuser attention is requested but not properly
+    initialized (config missing or initialization failed).
+    """
+    _init_xfuser_attention()
+    if _xfuser_attention_fn is None:
+        config = get_parallel_config()
+        if config is not None:
+            raise RuntimeError(
+                "xFuser attention requested but failed to initialize. "
+                f"Config: backend={config.attention_backend}, "
+                f"ulysses={config.ulysses_degree}, ring={config.ring_degree}"
+            )
+        else:
+            raise RuntimeError(
+                "xFuser attention requested but parallel config is not set. "
+                "Ensure --ray is enabled and the runtime is initialized."
+            )
+    return _xfuser_attention_fn
+
+
+def _wan_t2v_usp_enabled(self, clip_fea=None, transformer_options=None, **kwargs):
+    """Check if USP (Ulysses Sequence Parallelism) should be used for this model call.
+
+    Strict guard: only enables USP for WAN T2V models with no clip_fea
+    (no image conditioning) and no unsupported special inputs.
+
+    Returns True only when ALL of the following are met:
+      - self.model_type == "t2v"
+      - Model was routed through Parallel Manager
+      - SP world size > 1
+      - clip_fea is None (no I2V image conditioning)
+      - No reference_latent (no reference-based generation)
+      - No audio_embed (no audio-conditioned generation)
+      - No control_video (no control-based generation)
+      - No reference_motion (no motion-reference generation)
+      - No pose_latents (no pose-conditioned generation)
+    """
+    model_type = getattr(self, "model_type", "t2v")
+    if model_type != "t2v":
+        return False
+
+    parallel_manager = (transformer_options or {}).get("parallel_manager", {})
+    if not parallel_manager.get("enabled", False):
+        return False
+
+    sp_world_size = get_sp_world_size()
+    if sp_world_size <= 1:
+        return False
+
+    # No image conditioning (I2V)
+    if clip_fea is not None:
+        return False
+
+    # No special WAN variants that require different USP handling
+    if kwargs.get("reference_latent") is not None:
+        return False
+    if kwargs.get("audio_embed") is not None:
+        return False
+    if kwargs.get("control_video") is not None:
+        return False
+    if kwargs.get("reference_motion") is not None:
+        return False
+    if kwargs.get("pose_latents") is not None:
+        return False
+    if kwargs.get("camera_conditions") is not None:
+        return False
+
+    return True
+
+
+def _pad_and_split_for_sp(tensor, dim=1):
+    if tensor is None:
+        return None, None
+
+    sp_world_size = get_sp_world_size()
+    if sp_world_size <= 1:
+        return tensor, tensor.size(dim)
+
+    orig_size = tensor.size(dim)
+    pad = (sp_world_size - orig_size % sp_world_size) % sp_world_size
+    if pad > 0:
+        pad_shape = list(tensor.shape)
+        pad_shape[dim] = pad
+        tensor = torch.cat(
+            [tensor, torch.zeros(pad_shape, dtype=tensor.dtype, device=tensor.device)],
+            dim=dim,
+        )
+
+    tensor = torch.chunk(tensor, sp_world_size, dim=dim)[get_sp_rank()]
+    return tensor, orig_size
+
+
+def _usp_self_attn_forward(self, x, freqs, transformer_options={}):
+    patches = transformer_options.get("patches", {})
+
+    b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
+
+    def qkv_fn_q(x):
+        q = self.norm_q(self.q(x)).view(b, s, n, d)
+        return apply_rope1(q, freqs)
+
+    def qkv_fn_k(x):
+        k = self.norm_k(self.k(x)).view(b, s, n, d)
+        return apply_rope1(k, freqs)
+
+    q = qkv_fn_q(x)
+    k = qkv_fn_k(x)
+
+    xfuser_attn = _get_xfuser_attention()
+    x = xfuser_attn(
+        q.view(b, s, n * d),
+        k.view(b, s, n * d),
+        self.v(x).view(b, s, n * d),
+        heads=self.num_heads,
+    )
+    x = x.flatten(2)
+
+    if "attn1_patch" in patches:
+        for p in patches["attn1_patch"]:
+            x = p({"x": x, "q": q, "k": k, "transformer_options": transformer_options})
+
+    x = self.o(x)
+    return x
+
+
+def _usp_t2v_cross_attn_forward(self, x, context, transformer_options={}):
+    q = self.norm_q(self.q(x))
+    k = self.norm_k(self.k(context))
+    v = self.v(context)
+
+    xfuser_attn = _get_xfuser_attention()
+    x = xfuser_attn(q, k, v, heads=self.num_heads)
+    x = x.flatten(2)
+    x = self.o(x)
+    return x
 
 
 def sinusoidal_embedding_1d(dim, position):
@@ -62,6 +257,9 @@ class WanSelfAttention(nn.Module):
             x(Tensor): Shape [B, L, num_heads, C / num_heads]
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
         """
+        if _wan_t2v_usp_enabled(self, transformer_options=transformer_options):
+            return _usp_self_attn_forward(self, x, freqs, transformer_options)
+
         patches = transformer_options.get("patches", {})
 
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
@@ -104,6 +302,9 @@ class WanT2VCrossAttention(WanSelfAttention):
             x(Tensor): Shape [B, L1, C]
             context(Tensor): Shape [B, L2, C]
         """
+        if _wan_t2v_usp_enabled(self, clip_fea=None, transformer_options=transformer_options, **kwargs):
+            return _usp_t2v_cross_attn_forward(self, x, context, transformer_options)
+
         # compute query, key, value
         q = self.norm_q(self.q(x))
         k = self.norm_k(self.k(context))
@@ -557,6 +758,11 @@ class WanModel(torch.nn.Module):
         transformer_options["grid_sizes"] = grid_sizes
         x = x.flatten(2).transpose(1, 2)
 
+        # SP padding/split for sequence parallel - only for T2V USP
+        if _wan_t2v_usp_enabled(self, clip_fea=clip_fea, transformer_options=transformer_options, **kwargs):
+            x, orig_seq_len = _pad_and_split_for_sp(x, dim=1)
+            freqs, _ = _pad_and_split_for_sp(freqs, dim=1)
+
         # time embeddings
         e = self.time_embedding(
             sinusoidal_embedding_1d(self.freq_dim, t.flatten()).to(dtype=x[0].dtype))
@@ -595,6 +801,13 @@ class WanModel(torch.nn.Module):
                 x = out["img"]
             else:
                 x = block(x, e=e0, freqs=freqs, context=context, context_img_len=context_img_len, transformer_options=transformer_options)
+
+        # SP all-gather and trim - only for T2V USP
+        if _wan_t2v_usp_enabled(self, clip_fea=clip_fea, transformer_options=transformer_options, **kwargs):
+            sp_group = get_sp_group()
+            if sp_group is not None:
+                x = sp_group.all_gather(x.contiguous(), dim=1)
+                x = x[:, :orig_seq_len, :]
 
         # head
         x = self.head(x, e)
@@ -1659,7 +1872,7 @@ class SCAILWanModel(WanModel):
         if clip_fea is not None:
             if self.img_emb is not None:
                 context_clip = self.img_emb(clip_fea)  # bs x 257 x dim
-                context = torch.cat([context_clip, context], dim=1)
+                context = torch.concat([context_clip, context], dim=1)
             context_img_len = clip_fea.shape[-2]
 
         patches_replace = transformer_options.get("patches_replace", {})

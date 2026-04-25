@@ -726,6 +726,70 @@ class LoraLoaderModelOnly(LoraLoader):
     def load_lora_model_only(self, model, lora_name, strength_model):
         return (self.load_lora(model, None, lora_name, strength_model, 0)[0],)
 
+class ParallelManager:
+    @classmethod
+    def INPUT_TYPES(s):
+        detected_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 1
+        return {"required": {
+            "model": ("MODEL",),
+            "ray_gpus": ("INT", {"default": max(1, detected_gpus), "min": 1, "max": 32, "step": 1}),
+            "sp_degree": ("INT", {"default": 1, "min": 1, "max": 16, "step": 1}),
+            "attention_backend": (["TORCH_FLASH", "FLASH_INFER", "SAGE_FP8_CUDA", "SAGE_FP8_SM90"], {"default": "TORCH_FLASH"}),
+        }}
+
+    RETURN_TYPES = ("MODEL",)
+    FUNCTION = "apply_parallel"
+    CATEGORY = "advanced/model/parallel"
+
+    def apply_parallel(self, model, ray_gpus, sp_degree, attention_backend):
+        ulysses_degree = sp_degree
+        ring_degree = 1
+        sync_ulysses = False
+
+        base_model = getattr(model, "model", model)
+        diffusion_model = getattr(base_model, "diffusion_model", None)
+        if (
+            diffusion_model is None
+            or diffusion_model.__class__.__name__ != "WanModel"
+            or getattr(diffusion_model, "model_type", None) != "t2v"
+        ):
+            raise RuntimeError("Sequence Parallel is currently not supported in this model")
+
+        model_patched = model.clone()
+        transformer_options = model_patched.model_options.setdefault("transformer_options", {})
+        transformer_options["parallel_manager"] = {
+            "enabled": True,
+            "ray_gpus": ray_gpus,
+            "ulysses_degree": ulysses_degree,
+            "ring_degree": ring_degree,
+            "cfg_degree": 1,
+            "attention_backend": attention_backend,
+            "sync_ulysses": sync_ulysses,
+        }
+
+        from comfy.distributed.parallel_state import configure_ray_parallel
+        from comfy.distributed.ray_runtime import init_ray_runtime
+
+        configure_ray_parallel(
+            ulysses_degree=ulysses_degree,
+            ring_degree=ring_degree,
+            cfg_degree=1,
+            attention_backend=attention_backend,
+            sync_ulysses=sync_ulysses,
+        )
+
+        if args.ray:
+            init_ray_runtime(
+                ray_gpus=ray_gpus,
+                ray_ulysses_degree=ulysses_degree,
+                ray_ring_degree=ring_degree,
+                ray_cfg_degree=1,
+                ray_attention=attention_backend,
+                ray_sync_ulysses=sync_ulysses,
+            )
+
+        return (model_patched,)
+
 class VAELoader:
     video_taes = ["taehv", "lighttaew2_2", "lighttaew2_1", "lighttaehy1_5", "taeltx_2"]
     image_taes = ["taesd", "taesdxl", "taesd3", "taef1"]
@@ -2078,6 +2142,7 @@ NODE_CLASS_MAPPINGS = {
     "LatentFlip": LatentFlip,
     "LatentCrop": LatentCrop,
     "LoraLoader": LoraLoader,
+    "ParallelManager": ParallelManager,
     "CLIPLoader": CLIPLoader,
     "UNETLoader": UNETLoader,
     "DualCLIPLoader": DualCLIPLoader,
@@ -2117,6 +2182,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "CheckpointLoaderSimple": "Load Checkpoint",
     "VAELoader": "Load VAE",
     "LoraLoader": "Load LoRA (Model and CLIP)",
+    "ParallelManager": "Parallel Manager",
     "LoraLoaderModelOnly": "Load LoRA",
     "CLIPLoader": "Load CLIP",
     "ControlNetLoader": "Load ControlNet Model",
