@@ -254,6 +254,10 @@ class _RayWorker:
 
     def _init_xfuser(self):
         """Initialize xFuser distributed environment."""
+        from comfy.distributed.parallel_state import (
+            configure_ray_parallel,
+            set_ray_runtime_available,
+        )
         from xfuser.core.distributed import (
             init_distributed_environment,
             initialize_model_parallel,
@@ -282,6 +286,17 @@ class _RayWorker:
             ulysses_degree=ulysses_degree,
             pipeline_parallel_degree=pp_degree,
         )
+
+        # Mirror the driver-side parallel state inside each worker process so
+        # WAN/xFuser code can resolve the configured backend at runtime.
+        configure_ray_parallel(
+            ulysses_degree=ulysses_degree,
+            ring_degree=ring_degree,
+            cfg_degree=cfg_degree,
+            attention_backend=parallel_dict.get("attention_backend", "TORCH_FLASH"),
+            sync_ulysses=parallel_dict.get("sync_ulysses", False),
+        )
+        set_ray_runtime_available(True)
 
         print(
             f"[Rank {self.local_rank}] Parallel Degree: "
