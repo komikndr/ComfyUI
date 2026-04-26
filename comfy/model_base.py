@@ -210,6 +210,26 @@ class BaseModel(torch.nn.Module):
         if "latent_shapes" in extra_conds:
             xc = utils.unpack_latents(xc, extra_conds.pop("latent_shapes"))
 
+        # Route through Ray executor if parallel manager is enabled
+        pm = transformer_options.get("parallel_manager", {})
+        if pm.get("enabled", False) and pm.get("model_path"):
+            try:
+                from comfy.distributed.ray_model_executor import get_model_executor
+                executor = get_model_executor()
+                if not executor._model_loaded:
+                    loading_options = pm.get("loading_options", {})
+                    executor.load_model(pm["model_path"], loading_options)
+
+                model_output = executor.forward(
+                    xc, t, context,
+                    control=control,
+                    transformer_options=transformer_options,
+                    **extra_conds
+                )
+                return self.model_sampling.calculate_denoised(sigma, model_output.float(), x)
+            except Exception as e:
+                print(f"[Ray] Parallel forward failed, falling back to local: {e}")
+
         model_output = self.diffusion_model(xc, t, context=context, control=control, transformer_options=transformer_options, **extra_conds)
         if len(model_output) > 1 and not torch.is_tensor(model_output):
             model_output, _ = utils.pack_latents(model_output)

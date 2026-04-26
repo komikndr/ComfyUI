@@ -368,6 +368,7 @@ class _RayWorker:
         clip_fea,
         freqs,
         transformer_options,
+        control=None,
         **kwargs,
     ):
         """Run a forward pass on this worker.
@@ -383,6 +384,7 @@ class _RayWorker:
             clip_fea: CLIP image features (optional).
             freqs: RoPE frequencies (ignored; model computes internally).
             transformer_options: ComfyUI transformer options.
+            control: ControlNet control signals (optional).
             **kwargs: Additional arguments (reference_latent, etc.).
 
         Returns:
@@ -400,6 +402,7 @@ class _RayWorker:
                 timestep=t,
                 context=context,
                 clip_fea=clip_fea,
+                control=control,
                 transformer_options=transformer_options,
                 **kwargs,
             )

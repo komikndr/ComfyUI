@@ -757,6 +757,16 @@ class ParallelManager:
 
         model_patched = model.clone()
         transformer_options = model_patched.model_options.setdefault("transformer_options", {})
+
+        # Extract model path from cached_patcher_init for Ray worker loading
+        cached_init = getattr(model, "cached_patcher_init", None)
+        model_path = None
+        if cached_init and len(cached_init) >= 2:
+            model_path = cached_init[1][0]
+
+        # Extract loading options (exclude transformer_options to avoid circular nesting)
+        loading_options = {k: v for k, v in model.model_options.items() if k != "transformer_options"}
+
         transformer_options["parallel_manager"] = {
             "enabled": True,
             "ray_gpus": ray_gpus,
@@ -765,6 +775,8 @@ class ParallelManager:
             "cfg_degree": 1,
             "attention_backend": attention_backend,
             "sync_ulysses": sync_ulysses,
+            "model_path": model_path,
+            "loading_options": loading_options,
         }
 
         from comfy.distributed.parallel_state import configure_ray_parallel

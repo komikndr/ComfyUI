@@ -94,14 +94,16 @@ class RayModelExecutor:
         clip_fea: torch.Tensor | None = None,
         freqs: torch.Tensor | None = None,
         transformer_options: dict | None = None,
+        control = None,
         **kwargs,
     ) -> torch.Tensor:
-        """Dispatch a forward pass to Ray workers with USP.
+        """Dispatch a forward pass to ALL Ray workers simultaneously for USP.
 
         For USP (Ulysses Sequence Parallelism), the WAN model's
         ``forward_orig()`` handles input splitting and output gathering
-        internally.  This method simply passes the full inputs to the
-        worker corresponding to the current SP rank.
+        internally.  All workers must participate in the forward pass
+        because attention requires all-to-all communication and the
+        final output is all-gathered.
 
         Args:
             x: Latent input tensor of shape [B, C_in, F, H, W].
@@ -110,6 +112,7 @@ class RayModelExecutor:
             clip_fea: Optional CLIP image features for I2V.
             freqs: RoPE frequencies (ignored; model computes internally).
             transformer_options: ComfyUI transformer options dict.
+            control: ControlNet control signals (optional).
             **kwargs: Additional model-specific arguments.
 
         Returns:
@@ -122,20 +125,23 @@ class RayModelExecutor:
         if not actors:
             raise RuntimeError("No Ray actors available.")
 
-        sp_rank = get_sp_rank()
-
-        # Dispatch full inputs to the worker at the current SP rank.
-        # The model's forward_orig() handles USP splitting/gathering internally.
+        # Dispatch to ALL workers simultaneously for USP.
+        # The WAN model's forward_orig() splits input by SP rank,
+        # processes through blocks with all-to-all in attention,
+        # and all-gathers the final output. All workers produce
+        # the same output after all-gather.
         try:
-            output = ray.get(
-                actors[sp_rank].forward.remote(
-                    x, t, context, clip_fea, freqs, transformer_options or {}, **kwargs
+            futures = [
+                actor.forward.remote(
+                    x, t, context, clip_fea, freqs,
+                    transformer_options or {}, control, **kwargs
                 )
-            )
+                for actor in actors
+            ]
+            results = ray.get(futures)
+            return results[0]
         except Exception as e:
-            raise RuntimeError(f"Ray forward failed on rank {sp_rank}: {e}") from e
-
-        return output
+            raise RuntimeError(f"Ray forward failed: {e}") from e
 
 
 def _split_for_sp(tensor: torch.Tensor, dim: int = 1):
