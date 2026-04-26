@@ -215,6 +215,16 @@ class BaseModel(torch.nn.Module):
         if pm.get("enabled", False) and pm.get("model_path"):
             try:
                 from comfy.distributed.ray_model_executor import get_model_executor
+
+                # Keep the driver process from holding a duplicate UNet copy on
+                # cuda:0 while Ray workers own the parallel execution copy.
+                if getattr(self, "current_patcher", None) is not None and not getattr(self, "_ray_driver_offloaded", False):
+                    try:
+                        self.current_patcher.partially_unload(self.current_patcher.offload_device, memory_to_free=1e32)
+                        self._ray_driver_offloaded = True
+                    except Exception:
+                        pass
+
                 executor = get_model_executor()
                 if not executor._model_loaded:
                     loading_options = pm.get("loading_options", {})
