@@ -396,18 +396,15 @@ class _RayWorker:
         model = self._model
         base_model = model.model if hasattr(model, "model") else model
 
-        if hasattr(base_model, "forward"):
-            output = base_model.forward(
-                x,
-                timestep=t,
-                context=context,
-                clip_fea=clip_fea,
-                control=control,
-                transformer_options=transformer_options,
-                **kwargs,
-            )
-        else:
-            raise RuntimeError(f"Model has no forward method: {type(base_model)}")
+        output = base_model.apply_model(
+            x,
+            t,
+            c_concat=clip_fea,
+            c_crossattn=context,
+            control=control,
+            transformer_options=transformer_options,
+            **kwargs,
+        )
 
         return output
 
